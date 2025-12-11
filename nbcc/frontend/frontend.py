@@ -1,9 +1,8 @@
-import warnings
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pprint import pprint
 from typing import Any, Sequence
+from pathlib import Path
 
 from numba_scfg.core.datastructures.basic_block import (
     BasicBlock,
@@ -22,17 +21,18 @@ from sealir.rvsdg import format_rvsdg
 from sealir.rvsdg import grammar as rg
 from sealir.rvsdg import internal_prefix
 from spy.fqn import FQN
-from spy.interop import redshift
 from spy.vm.function import W_ASTFunc, W_BuiltinFunc, W_FuncType
 from spy.vm.struct import W_StructType
 from spy.vm.modules.types import W_Type, W_LiftedType
 from spy.vm.vm import SPyVM
 from spy.location import Loc
+from spy.vm.module import W_Module
 
 from . import grammar as sg
 from .restructure import SCFG, SpyBasicBlock, _SpyScfgRenderer, restructure
 from .spy_ast import Node, convert_to_node
 from nbcc.developer import TODO
+from . import extra_spy_builtins
 
 
 @dataclass(frozen=True)
@@ -75,6 +75,25 @@ class TranslationUnit:
         cname = self.__class__.__name__
         syms = ", ".join(map(str, self._symtabs))
         return f"{cname}([{syms}])"
+
+
+def redshift(filename: str | Path) -> tuple[SPyVM, W_Module]:
+    """
+    Perform redshift on the given file
+
+    NOTE: this is adapted from `spy/interop.py`
+    """
+    filename = Path(filename)
+    modname = filename.stem
+    builddir = filename.parent
+    vm = SPyVM()
+    # Install custom builtins here
+    vm.make_module(extra_spy_builtins.MLIR)
+    # End custom builtins
+    vm.path.append(str(builddir))
+    w_mod = vm.import_(modname)
+    vm.redshift(error_mode="eager")
+    return vm, w_mod
 
 
 def frontend(filename: str, *, view: bool = False) -> TranslationUnit:
