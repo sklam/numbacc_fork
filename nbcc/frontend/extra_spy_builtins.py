@@ -113,7 +113,7 @@ def w_MLIR_transform(
 ) -> W_ASTFunc:
     newfn = W_ASTFunc(
         w_functype=fn.w_functype,
-        fqn=fn.fqn.with_qualifiers(["transformed"]),
+        fqn=fn.fqn.with_suffix("transformed"),
         funcdef=fn.funcdef,
         closure=fn.closure,
         locals_types_w=fn.locals_types_w,

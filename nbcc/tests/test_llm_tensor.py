@@ -129,7 +129,7 @@ def test_bench_nbcc_softmax_fused(benchmark):
         lib = CDLL(libname)
 
         export_function = getattr(
-            lib, "_mlir_ciface_spy_llm_tensor$export_softmax__transformed"
+            lib, "_mlir_ciface_spy_llm_tensor$export_softmax$transformed"
         )
         print(export_function)
 
