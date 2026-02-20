@@ -1,9 +1,11 @@
 def main() -> i32:
     a = 23
     b = 46
+    d = 43
     if a > b:
         c = a - b
         print("a is bigger")
+        d = 3 + 3
     else:
         c = b - a
         print("b is bigger")
@@ -18,5 +20,6 @@ def main() -> i32:
         print("b is bigger")
     print('endif')
     print(c)
+    print(d)
 
     return 0

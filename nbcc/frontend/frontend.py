@@ -161,11 +161,9 @@ def convert_to_sexpr(
     vm: SPyVM,
 ) -> tuple[SCFG, list]:
     vui = recursive_compute_uses(scfg)
-    # print(vui.dump())
     print("propagate_lifetime".center(80, '-'))
     vui.propagate_lifetime()
     print(vui.dump())
-    breakpoint()
     with ase.Tape() as tape:
         cts = ConvertToSExpr(tape, local_types, global_ns, vm, vui)
         with cts.setup_function(func_node) as rb:
@@ -211,6 +209,7 @@ class VarUseInfo:
     def propagate(self, successor: VarUseInfo) -> None:
         """Reverse propagation"""
         self.usednames |= successor.usednames
+        self.defnames |= successor.defnames
 
     def propagate_lifetime(self, parent: VarUseInfo|None =None) -> None:
         by_kinds = defaultdict(set)
@@ -224,8 +223,17 @@ class VarUseInfo:
             head_vui = self.regions[ref_head]
             for ref_br in by_kinds['branch']:
                 br_vui = self.regions[ref_br]
-                br_vui.propagate(tail_vui)
                 head_vui.propagate(br_vui)
+                # if it's defined in one branch, it is used by all branch so
+                # that branches that didn't define the variable is returning
+                # the value at the branch head.
+                head_vui.usednames |= br_vui.defnames
+            # Update the branches
+            for ref_br in by_kinds['branch']:
+                br_vui = self.regions[ref_br]
+                br_vui.usednames |= head_vui.usednames
+
+            head_vui.propagate(tail_vui)
 
     def dump(self) -> str:
         from textwrap import indent
@@ -584,7 +592,6 @@ class ConvertToSExpr:
             else_liveset = ctx.vui.regions[RegionRef(else_block)].usednames
             tail_liveset = ctx.vui.regions[RegionRef(tail_block)].usednames
             operands = ctx.get_scope_as_operands(then_liveset|else_liveset)
-            print("operands", operands)
 
             with ctx.new_region(then_block, ctx.get_scope_as_parameters(then_liveset|else_liveset)) as rb_then:
                 self.codegen(then_block)
@@ -595,8 +602,6 @@ class ConvertToSExpr:
             updated_vars = ctx.compute_updated_vars(rb_then)
             updated_vars |= ctx.compute_updated_vars(rb_else)
             updated_vars = (updated_vars & tail_liveset) | {k for k in updated_vars if k.startswith('!')}
-            print(updated_vars)
-            breakpoint()
             region_then = ctx.close_region(rb_then, updated_vars)
             region_else = ctx.close_region(rb_else, updated_vars)
 

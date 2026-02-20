@@ -45,6 +45,7 @@ endif
 a is bigger
 endif
 389
+43
 """
     run_e2e_test("e2e_ifelse.spy", expected)
 
