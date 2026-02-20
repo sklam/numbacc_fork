@@ -1,3 +1,4 @@
+from __future__ import annotations
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -136,6 +137,7 @@ def frontend(filename: str, *, view: bool = False) -> TranslationUnit:
         scfg = restructure(fqn.fullname, func_node)
         if view:
             _SpyScfgRenderer(scfg).view()
+
         region, mds = convert_to_sexpr(
             func_node,
             scfg,
@@ -158,13 +160,130 @@ def convert_to_sexpr(
     global_ns: dict[FQN, dict[str, W_Type]],
     vm: SPyVM,
 ) -> tuple[SCFG, list]:
+    vui = recursive_compute_uses(scfg)
+    # print(vui.dump())
+    print("propagate_lifetime".center(80, '-'))
+    vui.propagate_lifetime()
+    print(vui.dump())
+    breakpoint()
     with ase.Tape() as tape:
-        cts = ConvertToSExpr(tape, local_types, global_ns, vm)
+        cts = ConvertToSExpr(tape, local_types, global_ns, vm, vui)
         with cts.setup_function(func_node) as rb:
             cts.handle_region(scfg)
 
         region = cts.close_function(rb, func_node, fn_type)
         return region, cts._metadata
+
+
+@dataclass
+class RegionRef:
+    region: RegionBlock
+
+    def __hash__(self):
+        return id(self.region)
+
+    def __eq__(self, other):
+        if not isinstance(other, RegionRef):
+            return NotImplemented
+        return self.region == other.region
+
+    def __repr__(self):
+        return f"RegionRef({self.region.name}@{hex(id(self.region))})"
+
+
+@dataclass
+class VarUseInfo:
+    usednames: set[str] = field(default_factory=set)
+    defnames: set[str] = field(default_factory=set)
+    ops: dict[Node, VarUseInfo] = field(default_factory=dict)
+    regions: dict[RegionRef, VarUseInfo] = field(default_factory=dict)
+
+    def merge_op(self, node: Node, inner_vui: VarUseInfo) -> None:
+        self.ops[node] = inner_vui
+        self.defnames |= inner_vui.defnames
+        self.usednames |= inner_vui.usednames
+
+    def merge_region(self, blk: RegionBlock, other: VarUseInfo) -> None:
+        self.usednames |= other.usednames
+        self.defnames |= other.defnames
+        self.regions[RegionRef(blk)] = other
+
+    def propagate(self, successor: VarUseInfo) -> None:
+        """Reverse propagation"""
+        self.usednames |= successor.usednames
+
+    def propagate_lifetime(self, parent: VarUseInfo|None =None) -> None:
+        by_kinds = defaultdict(set)
+        for ref, vui in self.regions.items():
+            vui.propagate_lifetime(self)
+            by_kinds[ref.region.kind].add(ref)
+        if 'branch' in by_kinds:
+            [ref_tail] = by_kinds['tail']
+            tail_vui = self.regions[ref_tail]
+            [ref_head] = by_kinds['head']
+            head_vui = self.regions[ref_head]
+            for ref_br in by_kinds['branch']:
+                br_vui = self.regions[ref_br]
+                br_vui.propagate(tail_vui)
+                head_vui.propagate(br_vui)
+
+    def dump(self) -> str:
+        from textwrap import indent
+        buf = [
+            f'usednames: {self.usednames}',
+            f'defnames: {self.defnames}',
+        ]
+
+        for i, (op, vui) in enumerate(self.ops.items()):
+            buf.append(f"- {i} {op}")
+            buf.append(indent(vui.dump(), '  '))
+
+        for ref, vui in self.regions.items():
+            buf.append(f"region {ref.region.name} :: {type(ref.region)}")
+            buf.append(indent(vui.dump(), ' ' * 4))
+
+        return '\n'.join(buf)
+
+
+def recursive_compute_uses(scfg) -> VarUseInfo:
+    vui = VarUseInfo()
+    for k, blk in scfg.region.subregion.graph.items():
+        if isinstance(blk, RegionBlock):
+            inner_vui = recursive_compute_uses(blk.subregion)
+            vui.merge_region(blk, inner_vui)
+        else:
+            assert isinstance(blk, SpyBasicBlock)
+            for node in blk.body:
+                inner_vui = VarUseInfo()
+                _vui_process_node(inner_vui, node)
+                vui.merge_op(node, inner_vui)
+
+    return vui
+
+def _vui_process_node(vui: VarUseInfo, node: Node):
+    match node:
+        case Node("AssignLocal"):
+            vui.defnames.add(node.target.value)
+            _vui_process_node(vui, node.value)
+            return
+
+        case Node("NameLocal"):
+            vui.usednames.add(node.sym.name)
+            return vui
+
+    for k, v in node._attrdict.items():
+        assert k not in {'symtable'}
+        match v:
+            case Node("NameLocal"):
+                vui.usednames.add(v.sym.name)
+
+            case Node():
+                _vui_process_node(vui, v)
+            case [*values]:
+                for vi in values:
+                    _vui_process_node(vui, vi)
+    return vui
+
 
 
 @dataclass(frozen=True)
@@ -178,6 +297,8 @@ class ConversionContext:
     grm: sg.Grammar
     local_types: dict[str, W_Type]
     global_ns: dict[FQN, dict[str, W_Type]]
+    root_vui: VarUseInfo
+    vui_stack: list[VarUseInfo] = field(init=False, default_factory=list)
     scope_stack: list = field(init=False, default_factory=list)
     scope_map: dict[Any, Scope] = (
         field(  # Keys are wrapped NamedSExpr[Grammar, RegionBegin]
@@ -231,8 +352,8 @@ class ConversionContext:
     # Removed unused unwrapping utilities that are no longer needed after type annotation fixes
 
     @contextmanager
-    def new_region(self, region_parameters: Sequence[str]):
-
+    def new_region(self, region_block: RegionBlock|None, region_parameters: Sequence[str]):
+        print("new region with params", region_parameters)
         write = self.grm.write
         rb = write(
             rg.RegionBegin(
@@ -245,11 +366,21 @@ class ConversionContext:
         self.scope_map[rb] = scope
         self.scope_stack.append(scope)
 
+        if region_block is None:
+            self.vui_stack.append(self.root_vui)
+        else:
+            self.vui_stack.append(self.vui.regions[RegionRef(region_block)])
+
         self.initialize_scope(rb)
 
         yield rb
 
         self.scope_stack.pop()
+        self.vui_stack.pop()
+
+    @property
+    def vui(self) -> VarUseInfo:
+        return self.vui_stack[-1]
 
     def initialize_scope(
         self, rb
@@ -281,14 +412,20 @@ class ConversionContext:
 
         return write(rg.RegionEnd(begin=rb, ports=tuple(ports)))
 
-    def get_scope_as_operands(self) -> tuple[ase.SExpr, ...]:
+    def get_scope_as_operands(self, liveset: set|None=None) -> tuple[ase.SExpr, ...]:
         operands = []
-        for _, v in sorted(self.scope.local_vars.items()):
-            operands.append(v)
+        print('scope-as-operands')
+        for k, v in sorted(self.scope.local_vars.items()):
+            if liveset is None or (k.startswith('!') or k in liveset):
+                print('   ', k, '---', v)
+                operands.append(v)
         return tuple(operands)
 
-    def get_scope_as_parameters(self) -> tuple[str, ...]:
-        return tuple(sorted(self.scope.local_vars))
+    def get_scope_as_parameters(self, liveset:set|None=None) -> tuple[str, ...]:
+        if liveset is None:
+            return tuple(sorted(self.scope.local_vars))
+        else:
+            return tuple(sorted(filter(lambda k: k in liveset or k.startswith('!'), self.scope.local_vars)))
 
 
 class ConvertToSExpr:
@@ -298,12 +435,14 @@ class ConvertToSExpr:
         local_types: dict[str, W_Type],
         global_ns: dict[FQN, dict[str, W_Type]],
         vm: SPyVM,
+        vui: VarUseInfo,
     ):
         self._tape = tape
         self._context = ConversionContext(
             grm=sg.Grammar(self._tape),
             local_types=local_types,
             global_ns=global_ns,
+            root_vui=vui,
         )
         self._metadata: list[ase.SExpr] = []
         self._local_types = local_types
@@ -365,7 +504,7 @@ class ConvertToSExpr:
                 raise ValueError(func_node)
 
         ctx = self._context
-        with ctx.new_region([internal_prefix("io")]) as rb:
+        with ctx.new_region(None, [internal_prefix("io")]) as rb:
             for k, v in argmap.items():
                 self._context.store_local(k, v)
             yield rb
@@ -434,7 +573,6 @@ class ConvertToSExpr:
             kind = getattr(block, "kind", None)
             by_kinds[kind].append(block)
 
-        print("--by-kinds", [(k, len(vs)) for k, vs in by_kinds.items()])
         if "branch" in by_kinds:
             [head_block] = by_kinds["head"]
             [then_block, else_block] = by_kinds["branch"]
@@ -442,17 +580,23 @@ class ConvertToSExpr:
 
             test_expr = self.codegen(head_block)
 
-            operands = ctx.get_scope_as_operands()
+            then_liveset = ctx.vui.regions[RegionRef(then_block)].usednames
+            else_liveset = ctx.vui.regions[RegionRef(else_block)].usednames
+            tail_liveset = ctx.vui.regions[RegionRef(tail_block)].usednames
+            operands = ctx.get_scope_as_operands(then_liveset|else_liveset)
+            print("operands", operands)
 
-            with ctx.new_region(ctx.get_scope_as_parameters()) as rb_then:
+            with ctx.new_region(then_block, ctx.get_scope_as_parameters(then_liveset|else_liveset)) as rb_then:
                 self.codegen(then_block)
 
-            with ctx.new_region(ctx.get_scope_as_parameters()) as rb_else:
+            with ctx.new_region(else_block, ctx.get_scope_as_parameters(then_liveset|else_liveset)) as rb_else:
                 self.codegen(else_block)
 
             updated_vars = ctx.compute_updated_vars(rb_then)
             updated_vars |= ctx.compute_updated_vars(rb_else)
-
+            updated_vars = (updated_vars & tail_liveset) | {k for k in updated_vars if k.startswith('!')}
+            print(updated_vars)
+            breakpoint()
             region_then = ctx.close_region(rb_then, updated_vars)
             region_else = ctx.close_region(rb_else, updated_vars)
 
@@ -478,6 +622,7 @@ class ConvertToSExpr:
                 ),
             )
             ctx.update_scope(ifelse, sorted(updated_vars))
+            ctx.vui_stack.append(ctx.vui.regions[RegionRef(tail_block)])
             return self.codegen(tail_block)
 
         else:
