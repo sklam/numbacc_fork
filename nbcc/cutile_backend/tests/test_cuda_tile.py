@@ -75,3 +75,34 @@ def test_cuda_tile_vecadd():
     got = np.asarray(x_tensor.cpu())
     expect = np.arange(got.size, dtype=np.float64) * 2
     np.testing.assert_array_equal(actual=got, desired=expect)
+
+
+def test_cuda_tile_ifelse():
+    import torch
+    import cuda.tile as ct
+    from nbcc.cutile_backend.loader import compiler_context
+
+    with compile_mlir("tile_example.spy") as mlir_mod:
+        mlir_text = mlir_mod.operation.get_asm()
+
+    kernel_name = "spy_tile_example$exported$export_ifelse"
+    with compiler_context() as cc:
+        kernel = cc.compile_kernel(
+            mlir_text, kernel_name, (False, False, False)
+        )
+        nelem = 128
+        # Test with bypass compute ON
+        x_tensor = torch.arange(nelem, dtype=torch.float64, device="cuda")
+        ct.launch(torch.cuda.current_stream(), (1,), kernel, (x_tensor, True))
+
+        np.testing.assert_array_equal(
+            np.asarray(x_tensor.cpu()), np.arange(nelem, dtype=np.float64)
+        )
+
+        # Repeat test without the bypass compute
+        x_tensor = torch.arange(nelem, dtype=torch.float64, device="cuda")
+        ct.launch(torch.cuda.current_stream(), (1,), kernel, (x_tensor, False))
+
+        np.testing.assert_array_equal(
+            np.asarray(x_tensor.cpu()), 2 * np.arange(nelem, dtype=np.float64)
+        )

@@ -63,8 +63,10 @@ class CompilerContext:
 
 
 @contextmanager
-def compiler_context() -> Generator[CompilerContext, None, None]:
-    with tempfile.TemporaryDirectory() as dirpathstr:
+def compiler_context(
+    keep: bool = False,
+) -> Generator[CompilerContext, None, None]:
+    with tempfile.TemporaryDirectory(delete=not keep) as dirpathstr:
         yield CompilerContext(dirpath=Path(dirpathstr))
 
 
