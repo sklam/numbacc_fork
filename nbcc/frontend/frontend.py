@@ -194,6 +194,7 @@ class RegionRef:
 
 @dataclass
 class VarUseInfo:
+    region_name: str
     usednames: set[str] = field(default_factory=set)
     defnames: set[str] = field(default_factory=set)
     ops: dict[Node, VarUseInfo] = field(default_factory=dict)
@@ -214,6 +215,17 @@ class VarUseInfo:
         self.usednames |= successor.usednames
         self.defnames |= successor.defnames
 
+    def find_region(self, region_ref: RegionRef) -> VarUseInfo | None:
+        """Recursively search for a region in this VUI hierarchy"""
+        if region_ref in self.regions:
+            return self.regions[region_ref]
+        # Search in nested regions
+        for vui in self.regions.values():
+            result = vui.find_region(region_ref)
+            if result is not None:
+                return result
+        return None
+
     def propagate_lifetime(self, parent: VarUseInfo|None =None) -> None:
         by_kinds = defaultdict(set)
         for ref, vui in self.regions.items():
@@ -231,6 +243,7 @@ class VarUseInfo:
                 # that branches that didn't define the variable is returning
                 # the value at the branch head.
                 head_vui.usednames |= br_vui.defnames
+                tail_vui.defnames |= br_vui.defnames
             # Update the branches
             for ref_br in by_kinds['branch']:
                 br_vui = self.regions[ref_br]
@@ -256,6 +269,7 @@ class VarUseInfo:
     def dump(self) -> str:
         from textwrap import indent
         buf = [
+            f"Region {self.region_name}",
             f'usednames: {self.usednames}',
             f'defnames: {self.defnames}',
         ]
@@ -272,7 +286,7 @@ class VarUseInfo:
 
 
 def recursive_compute_uses(scfg) -> VarUseInfo:
-    vui = VarUseInfo()
+    vui = VarUseInfo(region_name=scfg.region.name)
     for k, blk in scfg.region.subregion.graph.items():
         if isinstance(blk, RegionBlock):
             inner_vui = recursive_compute_uses(blk.subregion)
@@ -284,7 +298,7 @@ def recursive_compute_uses(scfg) -> VarUseInfo:
                 vui.usednames.add(blk.variable)
                 continue
             elif isinstance(blk, (SyntheticReturn,)):
-                vui.usednames.add("__scfg_return_value__")
+                vui.defnames.add("__scfg_return_value__")
                 continue
             elif isinstance(blk, (SyntheticAssignment,)):
                 for k in blk.variable_assignment:
@@ -294,10 +308,11 @@ def recursive_compute_uses(scfg) -> VarUseInfo:
                 raise AssertionError(type(blk))
             assert isinstance(blk, SpyBasicBlock)
             for node in blk.body:
-                inner_vui = VarUseInfo()
+                inner_vui = VarUseInfo(blk.name)
                 _vui_process_node(inner_vui, node)
                 vui.merge_op(node, inner_vui)
-
+    # HACK: add return_value everywhere
+    vui.usednames.add("__scfg_return_value__")
     return vui
 
 def _vui_process_node(vui: VarUseInfo, node: Node):
@@ -360,7 +375,11 @@ class ConversionContext:
         self.scope.local_vars[target] = expr
 
     def load_local(self, target: str) -> ase.SExpr:
-        return self.scope.local_vars[target]
+        try:
+            return self.scope.local_vars[target]
+        except KeyError as e:
+            e.add_note(f"VUI {self.vui.region_name}")
+            raise
 
     def get_io(self) -> ase.SExpr:
         out = self.load_local(internal_prefix("io"))
@@ -393,7 +412,6 @@ class ConversionContext:
 
     @contextmanager
     def new_region(self, region_block: RegionBlock|None, region_parameters: Sequence[str]):
-        print("new region with params", region_parameters)
         write = self.grm.write
         rb = write(
             rg.RegionBegin(
@@ -411,7 +429,11 @@ class ConversionContext:
         if region_block is None:
             self.vui_stack.append(self.root_vui)
         else:
-            self.vui_stack.append(self.vui.regions[RegionRef(region_block)])
+            region_vui = self.root_vui.find_region(RegionRef(region_block))
+            if region_vui is None:
+                raise KeyError(f"Region {region_block.name} not found in VUI hierarchy (current: {self.vui.region_name})")
+            self.vui_stack.append(region_vui)
+
 
         self.initialize_scope(rb)
 
@@ -624,9 +646,9 @@ class ConvertToSExpr:
 
             test_expr = self.codegen(head_block)
 
-            then_liveset = ctx.vui.regions[RegionRef(then_block)].usednames
-            else_liveset = ctx.vui.regions[RegionRef(else_block)].usednames
-            tail_liveset = ctx.vui.regions[RegionRef(tail_block)].usednames
+            then_liveset = ctx.root_vui.find_region(RegionRef(then_block)).usednames
+            else_liveset = ctx.root_vui.find_region(RegionRef(else_block)).usednames
+            tail_liveset = ctx.root_vui.find_region(RegionRef(tail_block)).usednames
             operands = ctx.get_scope_as_operands(then_liveset|else_liveset)
 
             with ctx.new_region(then_block, ctx.get_scope_as_parameters(then_liveset|else_liveset)) as rb_then:
@@ -681,8 +703,16 @@ class ConvertToSExpr:
             case RegionBlock():
                 if isinstance(block.subregion, SCFG):
                     if block.kind == "loop":
-                        operands = ctx.get_scope_as_operands()
-                        operand_names = list(ctx.get_scope_as_parameters())
+                        # Use VUI liveset to determine loop parameters, like if/else branches do
+                        loop_vui = ctx.root_vui.find_region(RegionRef(block))
+                        if loop_vui is not None:
+                            loop_liveset = loop_vui.usednames
+                            operands = ctx.get_scope_as_operands(loop_liveset)
+                            operand_names = list(ctx.get_scope_as_parameters(loop_liveset))
+                        else:
+                            # Fallback to original behavior if VUI not found
+                            operands = ctx.get_scope_as_operands()
+                            operand_names = list(ctx.get_scope_as_parameters())
                         with ctx.new_region(block, operand_names) as loop_region:
                             self.handle_region(block.subregion)
                             loopcondvar = ctx.loopcond_name
@@ -744,7 +774,7 @@ class ConvertToSExpr:
                         case _:
                             raise ValueError(type(v))
                     ctx.store_local(k, const)
-                    return None
+                return None
 
             case SyntheticExitingLatch():
                 io = ctx.get_io()
