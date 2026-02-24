@@ -278,15 +278,20 @@ def recursive_compute_uses(scfg) -> VarUseInfo:
             inner_vui = recursive_compute_uses(blk.subregion)
             vui.merge_region(blk, inner_vui)
         else:
-            if isinstance(blk, (SyntheticBranch,)):
+            if isinstance(blk, (SyntheticTail, SyntheticFill,)):
+                continue  # skip these
+            elif isinstance(blk, (SyntheticBranch,)):
                 vui.usednames.add(blk.variable)
+                continue
+            elif isinstance(blk, (SyntheticReturn,)):
+                vui.usednames.add("__scfg_return_value__")
                 continue
             elif isinstance(blk, (SyntheticAssignment,)):
                 for k in blk.variable_assignment:
                     vui.defnames.add(k)
                 continue
             elif not isinstance(blk, SpyBasicBlock):
-                raise AssertionError
+                raise AssertionError(type(blk))
             assert isinstance(blk, SpyBasicBlock)
             for node in blk.body:
                 inner_vui = VarUseInfo()
