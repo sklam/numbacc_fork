@@ -6,6 +6,8 @@ from pathlib import Path
 from subprocess import check_output
 from typing import Any, Generator
 
+import numpy as np
+
 import pytest
 
 import nbcc
@@ -42,6 +44,7 @@ def test_cuda_tile_to_mlir():
         mlir_text = mlir_mod.operation.get_asm()
         assert "entry @spy_tile_example$exported$export_foo" in mlir_text
         assert "entry @spy_tile_example$exported$export_vecadd" in mlir_text
+        assert "entry @spy_tile_example$exported$export_ifelse" in mlir_text
         bcbytes = check_output(
             [
                 "cuda-tile-translate",
@@ -51,3 +54,24 @@ def test_cuda_tile_to_mlir():
             ],
             input=mlir_text.encode(),
         )
+
+
+def test_cuda_tile_vecadd():
+    import torch
+    import cuda.tile as ct
+    from nbcc.cutile_backend.loader import compiler_context
+
+    with compile_mlir("tile_example.spy") as mlir_mod:
+        mlir_text = mlir_mod.operation.get_asm()
+
+    kernel_name = "spy_tile_example$exported$export_vecadd"
+    with compiler_context() as cc:
+        kernel = cc.compile_kernel(
+            mlir_text, kernel_name, (False, False, False)
+        )
+        x_tensor = torch.arange(16, dtype=torch.float64, device="cuda")
+        ct.launch(torch.cuda.current_stream(), (1,), kernel, (x_tensor,))
+
+    got = np.asarray(x_tensor.cpu())
+    expect = np.arange(got.size, dtype=np.float64) * 2
+    np.testing.assert_array_equal(actual=got, desired=expect)
