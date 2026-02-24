@@ -8,6 +8,7 @@ from pathlib import Path
 from numba_scfg.core.datastructures.basic_block import (
     BasicBlock,
     RegionBlock,
+    SyntheticBranch,
     SyntheticAssignment,
     SyntheticExitBranch,
     SyntheticExitingLatch,
@@ -127,7 +128,7 @@ def frontend(filename: str, *, view: bool = False) -> TranslationUnit:
         elif isinstance(w_obj, W_StructType):
             tu.add_struct_type(fqn, w_obj)
         else:
-            breakpoint()
+            raise AssertionError
 
     # restructure
     for fqn, func_node in symtab.items():
@@ -161,6 +162,8 @@ def convert_to_sexpr(
     vm: SPyVM,
 ) -> tuple[SCFG, list]:
     vui = recursive_compute_uses(scfg)
+    print("VUI".center(80, '-'))
+    print(vui.dump())
     print("propagate_lifetime".center(80, '-'))
     vui.propagate_lifetime()
     print(vui.dump())
@@ -232,8 +235,23 @@ class VarUseInfo:
             for ref_br in by_kinds['branch']:
                 br_vui = self.regions[ref_br]
                 br_vui.usednames |= head_vui.usednames
-
             head_vui.propagate(tail_vui)
+        elif 'loop' in by_kinds:
+            assert len(by_kinds) == 1
+            [ref_loop] = by_kinds['loop']
+            loop_vui = self.regions[ref_loop]
+            # Update loop-exiting region.
+            # This is needed to make sure loop indvar are propagated.
+            exiting_reg = ref_loop.region.subregion[ref_loop.region.exiting]
+            last_block_in_loop = loop_vui.regions[RegionRef(exiting_reg)]
+            last_block_in_loop.defnames |= self.defnames
+            last_block_in_loop.usednames |= self.usednames
+            loop_vui.propagate_lifetime(self)
+        else:
+            assert not by_kinds, f'by_kinds: {by_kinds}'
+        if parent is not None:
+            parent.usednames |= self.usednames
+            # parent.defnames |= self.defnames
 
     def dump(self) -> str:
         from textwrap import indent
@@ -260,6 +278,15 @@ def recursive_compute_uses(scfg) -> VarUseInfo:
             inner_vui = recursive_compute_uses(blk.subregion)
             vui.merge_region(blk, inner_vui)
         else:
+            if isinstance(blk, (SyntheticBranch,)):
+                vui.usednames.add(blk.variable)
+                continue
+            elif isinstance(blk, (SyntheticAssignment,)):
+                for k in blk.variable_assignment:
+                    vui.defnames.add(k)
+                continue
+            elif not isinstance(blk, SpyBasicBlock):
+                raise AssertionError
             assert isinstance(blk, SpyBasicBlock)
             for node in blk.body:
                 inner_vui = VarUseInfo()
@@ -374,6 +401,8 @@ class ConversionContext:
         self.scope_map[rb] = scope
         self.scope_stack.append(scope)
 
+        vui_pre = self.vui if self.vui_stack else None
+
         if region_block is None:
             self.vui_stack.append(self.root_vui)
         else:
@@ -385,6 +414,8 @@ class ConversionContext:
 
         self.scope_stack.pop()
         self.vui_stack.pop()
+
+        vui_post = self.vui if self.vui_stack else None
 
     @property
     def vui(self) -> VarUseInfo:
@@ -494,7 +525,7 @@ class ConvertToSExpr:
             )
         else:
             print("???ty", ty, type(ty))
-            breakpoint()
+            raise AssertionError
 
     @contextmanager
     def setup_function(self, func_node: Node):
@@ -627,8 +658,11 @@ class ConvertToSExpr:
                 ),
             )
             ctx.update_scope(ifelse, sorted(updated_vars))
-            ctx.vui_stack.append(ctx.vui.regions[RegionRef(tail_block)])
-            return self.codegen(tail_block)
+            try:
+                ctx.vui_stack.append(ctx.vui.regions[RegionRef(tail_block)])
+                return self.codegen(tail_block)
+            finally:
+                ctx.vui_stack.pop()
 
         else:
             for _, blk in crv:
@@ -644,7 +678,7 @@ class ConvertToSExpr:
                     if block.kind == "loop":
                         operands = ctx.get_scope_as_operands()
                         operand_names = list(ctx.get_scope_as_parameters())
-                        with ctx.new_region(operand_names) as loop_region:
+                        with ctx.new_region(block, operand_names) as loop_region:
                             self.handle_region(block.subregion)
                             loopcondvar = ctx.loopcond_name
 
@@ -656,7 +690,7 @@ class ConvertToSExpr:
                         # Redo the loop region so that the incoming ports
                         # matches the outgoing ports
                         new_vars = sorted(updated_vars - {loopcondvar})
-                        with ctx.new_region(new_vars) as loop_region:
+                        with ctx.new_region(block, new_vars) as loop_region:
                             self.handle_region(block.subregion)
                             loopcondvar = ctx.loopcond_name
 
@@ -814,8 +848,6 @@ class ConvertToSExpr:
                     grm.write(sg.MLIR_asm(asm=tags.data['asm'], io))
                     """
 
-                # if callee_fqn.fullname.startswith("mlir_tensor::"):
-                #     breakpoint()
                 callee = grm.write(
                     rg.PyLoadGlobal(
                         io=ctx.get_io(), name=str(callee_fqn.fullname)
