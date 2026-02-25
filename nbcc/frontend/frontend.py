@@ -385,12 +385,13 @@ class VUIComputer(SCFGVisitor[VarUseInfo]):
 
         for k, blk in scfg.region.subregion.graph.items():
             self.dispatch_block(blk)
-
         return self.current_vui
 
     def visit_region_block(self, block: RegionBlock) -> None:
         """Visit RegionBlock and merge its subregion VUI."""
         inner_vui = VUIComputer().visit(block.subregion)
+        if block.exiting:
+            inner_vui.usednames.add("__scfg_return_value__")
         self.current_vui.merge_region(block, inner_vui)
 
     def visit_spy_basic_block(self, block: SpyBasicBlock) -> None:
@@ -416,8 +417,6 @@ class VUIComputer(SCFGVisitor[VarUseInfo]):
     def post_visit(self, scfg: SCFG, result: VarUseInfo) -> None:
         """Apply post-processing: propagate lifetime and add global return value."""
         result.propagate_lifetime()
-        # HACK: add return_value everywhere (preserves existing behavior)
-        result.usednames.add("__scfg_return_value__")
 
 
 def _vui_process_node(vui: VarUseInfo, node: Node):
