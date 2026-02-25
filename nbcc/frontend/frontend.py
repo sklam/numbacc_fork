@@ -39,21 +39,6 @@ from .spy_ast import Node, convert_to_node
 from nbcc.developer import TODO
 from . import extra_spy_builtins
 
-"""
-SCFG Frontend Processing
-
-This module handles conversion from SPy AST to SCFG to S-expressions.
-
-Key components:
-- SCFGVisitor: Abstract base for standardized SCFG traversal
-- VUIComputer: Computes Variable Use Information using visitor pattern
-- SExprGenerator: Generates S-expressions using visitor pattern
-- convert_to_sexpr: Main entry point coordinating both phases
-
-The visitor pattern eliminates duplication between VUI computation and
-S-expression generation while ensuring identical traversal order.
-"""
-
 
 @dataclass(frozen=True)
 class FunctionInfo:
@@ -187,8 +172,6 @@ def convert_to_sexpr(
 
     print("propagate_lifetime".center(80, '-'))
     vui.propagate_lifetime()         # Now manually call propagate_lifetime
-    # HACK: add return_value everywhere (preserves existing behavior)
-    vui.usednames.add("__scfg_return_value__")
     print(vui.dump())
 
     # Phase 2: Generate S-expressions using new visitor
