@@ -237,6 +237,9 @@ class CuTileBackend(BackendInterface):
 
             return wrap
 
+        def is_struct_type(self, fqn: FQN, args: tuple) -> bool:
+            return self._tu.is_struct(fqn)
+
         @disp.case(type_name_matches("mlir::type::()"))
         def _handle_void(self, fqn: FQN, args: tuple):
             return ()
@@ -283,12 +286,35 @@ class CuTileBackend(BackendInterface):
         def _handle_none(self, fqn: FQN, args: tuple):
             return ()
 
+        @disp.case(is_struct_type)
+        def _handle_struct(self: Backend, fqn: FQN, args: tuple):
+            struct = self._tu.get_struct(fqn)
+            fields = list(struct.iterfields_w())
+            is_lifted_type = len(fields) == 1 and fields[0].name == "__ll__"
+            if is_lifted_type:
+                [ll_field] = fields
+                return self._dispatch_lower_type(
+                    self, fqn=ll_field.w_T.fqn, args=()
+                )
+            else:
+                TODO("regular non lifted struct type should go here")
+                raise NotImplementedError("TODO")
 
     def handle_builtin_op(
         self, op_name: str, args, state, lowering_instance=None
     ):
         """Handle builtin operations during lowering."""
-        raise NotImplementedError
+
+        match op_name:
+            case "struct_lift":
+                [lifted] = [v for v in args]
+                return lifted
+
+            case "struct_unlift":
+                [value] = args
+                return value
+
+        raise NotImplementedError(op_name)
 
     def handle_mlir_op(self, mlir_op: str, result_types, args):
         """Handle MLIR-specific operations during lowering."""

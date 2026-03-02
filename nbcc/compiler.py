@@ -13,6 +13,7 @@ import spy
 from egglog import EGraph
 from mlir import ir
 from sealir.ase import SExpr, TapeCrawler
+from sealir import ase
 from sealir.eqsat.rvsdg_convert import egraph_conversion
 from sealir.eqsat.rvsdg_eqsat import GraphRoot
 from sealir.eqsat.rvsdg_extract import CostModel as _CostModel
@@ -44,6 +45,21 @@ def compile_shared_lib(path: str, out_path: str) -> None:
     make_shared(module, out_path)
 
 
+def _forceinline(func_map: dict[str, rg.Func]):
+    for fname, rvsdg_ir in func_map.items():
+        print(fname.center(80, '-'))
+        print(format_rvsdg(rvsdg_ir))
+
+    # INLINE
+    inline_candidates: dict[ase.SExpr, str] = {}
+    for _, node in ase.walk_descendants_depth_first_no_repeat(rvsdg_ir):
+        if node._head == "FQN" and (fname:=node._args[0]) in func_map:
+            for caller in ase.search_parents(node, lambda sexpr: sexpr._head == "CallFQN"):
+                inline_candidates[caller] = fname
+
+    return inline_candidates
+
+
 def compile_to_mlir(
     path: str, be_type: Type[BackendInterface] = Backend
 ) -> ir.Module:
@@ -57,10 +73,20 @@ def compile_to_mlir(
     mdmap.load(mdlist)
 
     module = be.make_module(path)
+    for fname, rvsdg_ir in func_map.items():
+        print(fname.center(80, '-'))
+        print(format_rvsdg(rvsdg_ir))
+
+    inlining_map = _forceinline(func_map)
+
+    # import sys; sys.exit(0) # early stop
+
 
     transform_map: dict[str, Sequence[str]] = {}
     for fname, rvsdg_ir in func_map.items():
-        lowering = Lowering(be, module, mdmap, func_map)
+        if 'exported' not in fname:
+            continue
+        lowering = Lowering(be, module, mdmap, func_map, inlining_map)
         TODO("Not handling lowering argtypes")
         fn_op = lowering.lower(rvsdg_ir)
         print(fn_op.operation.get_asm())

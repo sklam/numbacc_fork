@@ -28,6 +28,8 @@ from nbcc.frontend import grammar as sg, TranslationUnit
 class LowerStates(ase.TraverseState):
     push: Callable
     get_region_args: Callable
+    get_arguments: Callable
+    get_region_stack: list
     function_block: Any
     constant_block: Any
 
@@ -243,6 +245,7 @@ class Lowering:
     be: BackendInterface
     module: Any
     mdmap: MDMap
+    inlining_map: dict[sg.CallFQN, str]
     loc: Any
 
     def __init__(
@@ -251,11 +254,13 @@ class Lowering:
         module: Any,
         mdmap: MDMap,
         func_map: dict[str, rg.Func],
+        inlining_map: dict[sg.CallFQN, str],
     ):
         self.be = be
         self.module = module
         self.mdmap = mdmap
         self.func_map = func_map
+        self.inlining_map = inlining_map
         self._declared: dict[str, Any] = {}
 
     def get_return_types(self, root) -> list[Any]:
@@ -308,7 +313,7 @@ class Lowering:
         arguments = root.args.arguments
 
         input_types = tuple(
-            [typ for arg in arguments for typ in self.be.lower_type(arg)]
+            [typ for arg in arguments for typ in self.be.lower_type(arg.annotation)]
         )
         output_types = self.get_return_types(root)
 
@@ -334,6 +339,9 @@ class Lowering:
         def get_region_args():
             return region_args[-1]
 
+        def get_arguments():
+            return region_args[0]
+
         with context, loc, function_entry:
             memo = ase.traverse(
                 cast(ase.SExpr, root),
@@ -347,6 +355,8 @@ class Lowering:
                 LowerStates(
                     push=push,
                     get_region_args=get_region_args,
+                    get_arguments=get_arguments,
+                    get_region_stack=region_args,
                     function_block=fun,
                     constant_block=constant_entry,
                 ),
@@ -430,7 +440,8 @@ class Lowering:
                 return tuple(portvalues)
 
             case rg.ArgRef(idx=int(idx), name=str(name)):
-                return state.function_block.arguments[idx]
+                args = state.get_arguments()
+                return args[idx + 1]
 
             case rg.Unpack(val=source, idx=int(idx)):
                 ports = yield cast(tuple, source)
@@ -594,6 +605,60 @@ class Lowering:
                 c_name = FQN(callee_fqn.fullname).c_name
 
                 callee_fqn_obj: FQN = FQN(callee_fqn.fullname)
+
+
+                TODO("BEGIN: HACKED FORCED INLINE ")
+                if expr in self.inlining_map:
+
+                    inlinee_rvsdg: rg.Func = self.func_map[callee_fqn.fullname]
+
+                    region_args = [(io_val, *lowered_args)]
+
+                    @contextmanager
+                    def inliner_push(arg_values):
+                        region_args.append(tuple(arg_values))
+                        try:
+                            yield
+                        finally:
+                            region_args.pop()
+
+                    def inliner_get_region_args():
+                        return region_args[-1]
+
+                    def inliner_get_arguments():
+                        return region_args[0]
+
+                    inner_state = LowerStates(
+                        push=inliner_push,
+                        get_region_args=inliner_get_region_args,
+                        get_arguments=inliner_get_arguments,
+                        get_region_stack=region_args,
+                        function_block=state.function_block,
+                        constant_block=state.constant_block,
+                    )
+
+                    root = inlinee_rvsdg.body
+                    outvalues = []
+                    memo = ase.traverse(
+                        cast(ase.SExpr, root),
+                        cast(
+                            Callable[
+                                [ase.SExpr, ase.TraverseState],
+                                "Coroutine[ase.SExpr, Any, Any]",
+                            ],
+                            self.lower_expr,
+                        ),
+                        inner_state,
+                        init_memo={}
+                    )
+
+                    for p in inlinee_rvsdg.body.ports:
+                        outval = memo[p.value]
+                        outvalues.append(outval)
+
+                    return outvalues
+
+                TODO("END: HACKED FORCED INLINE ")
 
                 if callee_fqn_obj.namespace.fullname == "mlir::op":
                     TODO("XXX: hardcode support of MLIR::OP ")

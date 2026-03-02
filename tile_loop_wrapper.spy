@@ -1,0 +1,238 @@
+"""
+Test this with:
+  python -m nbcc.cli mlir tile_example.spy out.mlir --backend=cutile
+  ../third-party/cuda-tile/build/bin/cuda-tile-opt --mlir-print-op-generic out.mlir
+
+More:
+  cuda-tile-translate out.mlir --bytecode-version=13.1 --mlir-to-cudatilebc --no-implicit-module -o example.tilebc
+  tileiras --gpu-name sm_120 example.tilebc -o example.cubin
+
+"""
+
+from mlir import MLIR_Type, MLIR_op, MLIR_asm, MLIR_unpack
+
+
+@blue.generic
+def GetPtrForTile(Tdata, BlkSz):
+    """
+
+      Raw Pointer                                    Operations
+           |                                             |
+           v                                             v
+     ┌─────────────┐    work()     ┌──────────────┐   ┌─────────────┐
+     │   Tp        │  ---------->  │ PointerTile  │   │ ValueTile   │
+     │ (raw_ptr)   │               │   __ll__:    │   │   __ll__:   │
+     └─────────────┘               │ TileNxPtrT   │   │  TileNxT    │
+                                   └──────┬───────┘   └─────┬───────┘
+                                          │                 │
+                       ┌──────────────────┼─────────────────┼──────────────────┐
+                       │                  │                 │                  │
+                       v                  v                 v                  v
+                ┌─────────────┐    ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+                │   load()    │    │   store()   │   │  __add__()  │   │   print()   │
+                │ PointerTile │    │ PointerTile │   │ ValueTile   │   │ ValueTile   │
+                │ -->         │    | <--         │ + | ValueTile   │   │             │
+                │ ValueTile   │    │ ValueTile   │   │             │   |             │
+                └─────────────┘    └─────────────┘   │             │   └─────────────┘
+                                                     └─────────────┘
+
+      Memory Access Layer              Computation Layer           Output Layer
+     ┌─────────────────────┐         ┌─────────────────────┐     ┌─────────────────────┐
+     │                     │         │                     │     │                     │
+     │  work(): Tp         │         │  ValueTile:         │     │  print(): stdout    │
+     │    ↓                │         │    - Addition       │     │                     │
+     │  PointerTile:       │         │    - Arithmetic ops │     │                     │
+     │    - load()         │ <-----> │                     │ --> │                     │
+     │    - store()        │         │  PointerTile:       │     │                     │
+     │                     │         │    - Memory bridge  │     │                     │
+     └─────────────────────┘         └─────────────────────┘     └─────────────────────┘
+
+
+    """
+    I32 = MLIR_Type("i32")
+    Ptr = MLIR_Type("ptr<{}>", Tdata)
+    Tp = MLIR_Type("!cuda_tile.tile<{}>", Ptr)
+    T1xp = MLIR_Type("!cuda_tile.tile<1x{}>", Ptr)
+    TNxp = MLIR_Type("!cuda_tile.tile<" + BlkSz + "x{}>", Ptr)
+    TNxI32 = MLIR_Type("!cuda_tile.tile<" + BlkSz + "x{}>", I32)
+
+    mlir_reshape = MLIR_asm("cuda_tile.reshape", T1xp, (Tp,))
+    mlir_broadcast = MLIR_asm("cuda_tile.broadcast", TNxp, (T1xp,))
+
+    TileNxPtrT = MLIR_Type("!cuda_tile.tile<128x{}>", Ptr)
+    TileNxI32 = MLIR_Type("!cuda_tile.tile<128x{}>", I32)
+
+    mlir_iota = MLIR_asm("cuda_tile.iota", TNxI32, ())
+
+    mlir_offset = MLIR_asm(
+        "cuda_tile.offset", TileNxPtrT, (TileNxPtrT, TileNxI32)
+    )
+
+    TileNxPtrT = MLIR_Type("!cuda_tile.tile<128x{}>", Ptr)
+    TileNxT = MLIR_Type("!cuda_tile.tile<128x{}>", Tdata)
+
+    Token = MLIR_Type("!cuda_tile.token")
+
+    mlir_load_ptr_tko = MLIR_asm(
+        "cuda_tile.load_ptr_tko {memory_ordering_semantics = 0 : i32, operandSegmentSizes = array<i32: 1, 0, 0, 0>}",
+        (TileNxT, Token),
+        (TileNxPtrT,),
+    )
+    mlir_unpack_0 = MLIR_unpack(mlir_load_ptr_tko, 0)
+
+    store_ptr_tko = MLIR_asm(
+        "cuda_tile.store_ptr_tko {memory_ordering_semantics = 0 : i32, operandSegmentSizes = array<i32: 1, 1, 0, 0>}",
+        Token,
+        (
+            TileNxPtrT,
+            TileNxT,
+        ),
+    )
+
+    mlir_addf = MLIR_asm(
+        "cuda_tile.addf {rounding_mode = #cuda_tile.rounding<nearest_even>}",
+        TileNxT,
+        (TileNxT, TileNxT),
+    )
+
+    bottom = MLIR_Type("()")
+    mlir_printfn = MLIR_asm(
+        r'cuda_tile.print {str="Data: %f\0A"}', bottom, (TileNxT,)
+    )
+
+    @struct
+    class ValueTile:
+        __ll__: TileNxT
+
+        def __add__(self, rhs: ValueTile) -> ValueTile:
+            return ValueTile(mlir_addf(self.__ll__, rhs.__ll__))
+
+        def print(self) -> None:
+            mlir_printfn(self.__ll__)
+
+    @struct
+    class PointerTile:
+        __ll__: TileNxPtrT
+
+        def load(self) -> ValueTile:
+            ptr = self.__ll__
+            tko = mlir_load_ptr_tko(ptr)
+            ret = mlir_unpack_0(tko)
+            return ValueTile(ret)
+
+        def store(self, v: ValueTile) -> None:
+            store_ptr_tko(self.__ll__, v.__ll__)
+
+    def work(raw_ptr: Tp) -> PointerTile:
+        iota = mlir_iota()
+        ptr_x_1 = mlir_reshape(raw_ptr)
+        ptr_x_n = mlir_broadcast(ptr_x_1)
+        gep_x_n = mlir_offset(ptr_x_n, iota)
+        return PointerTile(gep_x_n)
+
+    return work
+
+
+@blue
+def exported() -> None:
+    # Alias for types
+    F64 = MLIR_Type("f64")
+    I32 = MLIR_Type("i32")
+    PtrF64 = MLIR_Type("ptr<{}>", F64)
+    TilePtrF64 = MLIR_Type("!cuda_tile.tile<{}>", PtrF64)
+
+    TileI32 = MLIR_Type("!cuda_tile.tile<{}>", I32)
+
+    I1 = MLIR_Type("i1")
+    TileI1 = MLIR_Type("!cuda_tile.tile<{}>", I1)
+    equal = MLIR_asm(
+        "cuda_tile.cmpi {comparison_predicate=#cuda_tile.comparison_predicate<equal>, signedness=#cuda_tile.signedness<signed>}",
+        bool,
+        (TileI1, TileI1),
+    )
+    # "cuda_tile.constant"() <{value = dense<[1, 2, 3, 4]> : !cuda_tile.tile<4xi32>}> : () -> !cuda_tile.tile<4xi32>
+    const_zero = MLIR_asm(
+        "cuda_tile.constant {value = dense<false> : !cuda_tile.tile<i1>}",
+        TileI1,
+        (),
+    )
+
+    BlockSize = "128"  # Note: this should be a Int but SPy doesn't do `str(i32)` as blue
+    compute_tile_pointer = GetPtrForTile[F64, BlockSize]
+
+    """
+
+      Input Parameters
+     ┌─────────────────┐
+     │ a: TilePtrF64   │
+     │ size: TileI32   │
+     │ stride: TileI32 │
+     │ bypass: TileI1  │
+     └─────────┬───────┘
+               │
+               v
+     ┌─────────────────┐
+     │ compute_tile_   │
+     │ pointer(a)      │
+     │ ──────────────> │
+     │ ptrs            │
+     └─────────┬───────┘
+               │
+               v
+     ┌─────────────────┐
+     │ ptrs.load()     │
+     │ ──────────────> │
+     │ v (initial)     │
+     └─────────┬───────┘
+               │
+               v
+     ┌─────────────────┐
+     │ v = v + v       │  ← Double the value
+     │ (always done)   │
+     └─────────┬───────┘
+               │
+               v
+          ┌─────────┐
+          │ bypass  │
+          │ == 0?   │ ← Conditional Check
+          └────┬────┘
+               │
+          ┌────┴────┐
+          │ YES │NO │
+          v         v
+      ┌─────────┐   │
+      │ v += v  │   │  ← Quadruple if bypass == 0
+      │(double  │   │
+      │ again)  │   │
+      └────┬────┘   │
+           │        │
+           └────┬───┘
+                │
+                v
+      ┌─────────────────┐
+      │ v.print()       │  ← Output result
+      └─────────┬───────┘
+                │
+                v
+     ┌─────────────────┐
+     │ ptrs.store(v)   │  ← Store back to memory
+     └─────────────────┘
+
+    """
+    def export_ifelse(
+        a: TilePtrF64, size: TileI32, stride: TileI32, bypass: TileI1
+    ) -> None:
+        ptrs = compute_tile_pointer(a)
+        v = ptrs.load()
+
+        v = v + v  # Adding two tiles
+        if equal(bypass, const_zero()):
+            v += v  # Adding two tiles
+
+        v.print()
+        ptrs.store(v)
+
+        return
+
+
+_ = exported()

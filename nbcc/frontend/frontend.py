@@ -861,7 +861,7 @@ class SExprGenerator(SCFGVisitor[ase.SExpr|None]):
                 raise ValueError(func_node)
 
         ctx = self._context
-        with ctx.new_region(None, [internal_prefix("io")]) as rb:
+        with ctx.new_region(None, [internal_prefix("io"), *argmap.keys()]) as rb:
             for k, v in argmap.items():
                 self._context.store_local(k, v)
             yield rb
@@ -888,7 +888,10 @@ class SExprGenerator(SCFGVisitor[ase.SExpr|None]):
             typexpr = ctx.grm.write(sg.TypeExpr(name=fqn.fullname, args=()))
             argtypes.append(typexpr)
             self.insert_typeinfo(arg_sexpr, typexpr)
-        written_args = ctx.grm.write(rg.Args(arguments=tuple(argtypes)))
+
+        argspec_fixed = [ctx.grm.write(rg.ArgSpec(name=a.name, annotation=b))
+                         for a, b in zip(self._args, argtypes)]
+        written_args = ctx.grm.write(rg.Args(arguments=tuple(argspec_fixed)))
 
         retval = scope_map.local_vars[internal_prefix("ret")]
         ret_tyname = fn_type.w_restype.fqn.fullname

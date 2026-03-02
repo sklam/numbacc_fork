@@ -19,6 +19,7 @@ def encode_type_name(name: str) -> str:
     Returns:
         Base64 encoded string
     """
+
     return base64.urlsafe_b64encode(name.encode()).decode()
 
 
@@ -46,7 +47,8 @@ def encode_asm_operation(fqn_parts: list[str]) -> str:
     Returns:
         Base64 encoded string
     """
-    return base64.urlsafe_b64encode(("$".join(fqn_parts)).encode()).decode()
+    humane_name = re.sub(r"[^a-zA-Z0-9_]", "", '.'.join(fqn_parts))
+    return humane_name + "$$" + base64.urlsafe_b64encode(("$".join(fqn_parts)).encode()).decode()
 
 
 def decode_asm_operation(encoded: str) -> str:
@@ -59,7 +61,8 @@ def decode_asm_operation(encoded: str) -> str:
     Returns:
         Decoded operation string
     """
-    return base64.urlsafe_b64decode(encoded.encode()).decode()
+    tail = encoded.split("$$", 1)[1]
+    return base64.urlsafe_b64decode(tail.encode()).decode()
 
 
 def parse_composite_type(tyname: str) -> list[str] | None:
